@@ -4,10 +4,11 @@ import { randomUUID } from 'crypto';
 import { createStandaloneServer } from '../server.js';
 import { Config } from '../config.js';
 
+/** Session storage for streamable HTTP connections */
+const sessions = new Map<string, { transport: StreamableHTTPServerTransport; server: any }>();
+
 /**
- * Starts the HTTP transport server in STATELESS mode.
- * Each request creates a fresh server instance - required for Lambda/serverless
- * where requests may be routed to different instances.
+ * Starts the HTTP transport server
  * @param {Config} config - Server configuration
  */
 export function startHttpTransport(config: Config): void {
@@ -36,9 +37,7 @@ export function startHttpTransport(config: Config): void {
 }
 
 /**
- * Handles MCP protocol requests in STATELESS mode.
- * Creates a fresh server/transport for EVERY request.
- * This is required for Lambda/serverless deployments.
+ * Handles MCP protocol requests
  * @param {IncomingMessage} req - HTTP request
  * @param {ServerResponse} res - HTTP response
  * @param {Config} config - Server configuration
@@ -50,25 +49,63 @@ async function handleMcpRequest(
     res: ServerResponse,
     config: Config
 ): Promise<void> {
-    // STATELESS MODE: Create fresh server instance for each request
-    // No session storage - each request is self-contained
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+
+    if (sessionId) {
+        const session = sessions.get(sessionId);
+        if (!session) {
+            res.statusCode = 404;
+            res.end('Session not found');
+            return;
+        }
+        return await session.transport.handleRequest(req, res);
+    }
+
+    if (req.method === 'POST') {
+        await createNewSession(req, res, config);
+        return;
+    }
+
+    res.statusCode = 400;
+    res.end('Invalid request');
+}
+
+/**
+ * Creates a new MCP session for HTTP transport
+ * @param {IncomingMessage} req - HTTP request
+ * @param {ServerResponse} res - HTTP response
+ * @param {Config} config - Server configuration
+ * @returns {Promise<void>}
+ * @private
+ */
+async function createNewSession(
+    req: IncomingMessage,
+    res: ServerResponse,
+    config: Config
+): Promise<void> {
     const serverInstance = createStandaloneServer(config.apiKey);
     const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (sessionId) => {
-            console.log('Brave Search request:', sessionId);
+            sessions.set(sessionId, { transport, server: serverInstance });
+            console.log('New Brave Search session created:', sessionId);
         }
     });
+
+    transport.onclose = () => {
+        if (transport.sessionId) {
+            sessions.delete(transport.sessionId);
+            console.log('Brave Search session closed:', transport.sessionId);
+        }
+    };
 
     try {
         await serverInstance.connect(transport);
         await transport.handleRequest(req, res);
     } catch (error) {
-        console.error('Streamable HTTP error:', error);
-        if (!res.headersSent) {
-            res.statusCode = 500;
-            res.end('Internal server error');
-        }
+        console.error('Streamable HTTP connection error:', error);
+        res.statusCode = 500;
+        res.end('Internal server error');
     }
 }
 
